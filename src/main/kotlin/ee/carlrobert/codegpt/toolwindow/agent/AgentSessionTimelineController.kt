@@ -15,6 +15,7 @@ import com.intellij.util.ui.JBUI
 import ee.carlrobert.codegpt.EncodingManager
 import ee.carlrobert.codegpt.agent.AgentService
 import ee.carlrobert.codegpt.agent.ProxyAIAgent.loadProjectInstructions
+import ee.carlrobert.codegpt.agent.agentJson
 import ee.carlrobert.codegpt.agent.history.AgentCheckpointConversationMapper
 import ee.carlrobert.codegpt.agent.history.AgentCheckpointHistoryService
 import ee.carlrobert.codegpt.agent.history.AgentCheckpointTurnSequencer
@@ -47,24 +48,24 @@ internal data class AgentTimelineRunState(
     val sourceMessage: Message?
 )
 
+private data class SeededSessionState(
+    val conversation: Conversation,
+    val messageHistory: List<PromptMessage>
+)
+
 @OptIn(ExperimentalTime::class)
 internal class AgentSessionTimelineController(
     private val project: Project,
     private val agentSession: AgentSession,
     private val conversation: Conversation,
     private val runStateForRunIndex: (Int) -> AgentTimelineRunState?,
-    private val applySeededSessionState: (Conversation, CheckpointRef) -> Unit,
+    private val applySeededSessionState: (Conversation, List<PromptMessage>) -> Unit,
     private val onAfterRollbackRefresh: () -> Unit
 ) : Disposable {
-    private val replayJson = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-        explicitNulls = false
-    }
     private val rollbackService = RollbackService.getInstance(project)
     private val historyService = project.service<AgentCheckpointHistoryService>()
     private val historicalRollbackSupport =
-        AgentSessionTimelineHistoricalRollbackSupport(project, historyService, replayJson)
+        AgentSessionTimelineHistoricalRollbackSupport(project, historyService, agentJson)
     private val backgroundScope = DisposableCoroutineScope(Dispatchers.IO)
 
     private var sessionTimelinePointsCache: List<RunTimelinePoint>? = null
@@ -154,7 +155,7 @@ internal class AgentSessionTimelineController(
 
     private fun resolveTimelineAgentId(): String? {
         val resumeRef = agentSession.resumeCheckpointRef
-        return resumeRef?.agentId ?: agentSession.runtimeAgentId
+        return resumeRef?.agentId ?: agentSession.agentId
     }
 
     private suspend fun loadTimelineCheckpoints(agentId: String): List<AgentCheckpointData> {
@@ -208,9 +209,9 @@ internal class AgentSessionTimelineController(
                     return@runInEdt
                 }
 
-                val (seededConversation, seedRef) = payload
+                val seededConversation = payload.conversation
                 invalidateTimelineCache()
-                applySeededSessionState(seededConversation, seedRef)
+                applySeededSessionState(seededConversation, payload.messageHistory)
             }
         }
     }
@@ -239,12 +240,11 @@ internal class AgentSessionTimelineController(
                     return@runInEdt
                 }
 
-                val (seededConversation, seedRef) = payload
+                val seededConversation = payload.conversation
                 val newSession = AgentSession(
                     sessionId = UUID.randomUUID().toString(),
                     conversation = seededConversation,
-                    runtimeAgentId = seedRef.agentId,
-                    resumeCheckpointRef = seedRef
+                    seededMessageHistory = payload.messageHistory
                 )
                 project.service<AgentToolWindowContentManager>()
                     .createNewAgentTab(newSession, select = true)
@@ -256,7 +256,7 @@ internal class AgentSessionTimelineController(
         baseHistory: List<PromptMessage>,
         selectedNonSystemMessageCounts: Set<Int>,
         alwaysIncludedNonSystemMessageCounts: Set<Int>
-    ): Pair<Conversation, CheckpointRef>? {
+    ): SeededSessionState? {
         val history = rebuildHistoryFromEditedContext(
             baseHistory = baseHistory,
             selectedNonSystemMessageCounts = selectedNonSystemMessageCounts,
@@ -265,18 +265,17 @@ internal class AgentSessionTimelineController(
         return createSeededConversationFromHistory(history)
     }
 
-    private suspend fun createSeededConversationFromHistory(history: List<PromptMessage>): Pair<Conversation, CheckpointRef>? {
+    private fun createSeededConversationFromHistory(history: List<PromptMessage>): SeededSessionState? {
         if (history.none { it !is PromptMessage.System }) return null
 
-        val seedRef = project.service<AgentService>()
-            .createSeedCheckpointFromHistory(history)
-            ?: return null
-        val seedCheckpoint = historyService.loadCheckpoint(seedRef) ?: return null
         val seededConversation = AgentCheckpointConversationMapper.toConversation(
-            checkpoint = seedCheckpoint,
+            history = history,
             projectInstructions = loadProjectInstructions(project.basePath)
         )
-        return seededConversation to seedRef
+        return SeededSessionState(
+            conversation = seededConversation,
+            messageHistory = history
+        )
     }
 
     private fun rebuildHistoryFromEditedContext(
@@ -361,7 +360,7 @@ internal class AgentSessionTimelineController(
         return nonSystemMessages.mapIndexedNotNull { index, message ->
             val nonSystemMessageCount = index + 1
             if (nonSystemMessageCount in selectableNonSystemMessageCounts) return@mapIndexedNotNull null
-            if (message is PromptMessage.Tool.Result && !isInternalTimelineTool(message.tool)) {
+            if (message is PromptMessage.Tool.Result) {
                 return@mapIndexedNotNull null
             }
             nonSystemMessageCount
@@ -515,7 +514,6 @@ internal class AgentSessionTimelineController(
 
             is AgentCheckpointTurnSequencer.TurnEvent.ToolCall -> {
                 val toolName = event.tool.ifBlank { "Tool" }
-                if (isInternalTimelineTool(toolName)) return null
                 RunTimelinePoint(
                     cacheKey = "${checkpoint.checkpointId}:${event.nonSystemMessageCount}",
                     checkpointRef = checkpointRef,
@@ -773,12 +771,11 @@ internal class AgentSessionTimelineController(
             }
 
             runInEdt {
-                val (seededConversation, seedRef) = payload
+                val seededConversation = payload.conversation
                 val newSession = AgentSession(
                     sessionId = UUID.randomUUID().toString(),
                     conversation = seededConversation,
-                    runtimeAgentId = seedRef.agentId,
-                    resumeCheckpointRef = seedRef
+                    seededMessageHistory = payload.messageHistory
                 )
                 project.service<AgentToolWindowContentManager>()
                     .createNewAgentTab(newSession, select = true)
@@ -807,10 +804,6 @@ internal class AgentSessionTimelineController(
         return trimmed
     }
 
-    private fun isInternalTimelineTool(toolName: String): Boolean {
-        return AgentCheckpointTurnSequencer.isTodoWriteTool(toolName)
-    }
-
     private fun isTodoWriteTool(toolName: String): Boolean {
         return toolName.equals("TodoWrite", ignoreCase = true) ||
                 toolName.equals("TodoWriteTool", ignoreCase = true)
@@ -818,7 +811,7 @@ internal class AgentSessionTimelineController(
 
     private fun extractTodoWriteRunLabel(rawArgs: String): String? {
         val argsObject =
-            runCatching { replayJson.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
+            runCatching { agentJson.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
                 ?: return null
 
         listOf("title", "short_description", "description", "summary", "task").forEach { key ->
@@ -843,6 +836,7 @@ internal class AgentSessionTimelineController(
     private fun iconForTool(toolName: String): javax.swing.Icon {
         val normalized = toolName.lowercase()
         return when {
+            isTodoWriteTool(toolName) -> AllIcons.Actions.Checked
             normalized.contains("read") -> AllIcons.Actions.Show
             normalized.contains("bash") || normalized.contains("shell") -> AllIcons.Nodes.Console
             normalized.contains("search") -> AllIcons.Actions.Search
@@ -854,7 +848,7 @@ internal class AgentSessionTimelineController(
 
     private fun extractToolCallSubtitle(toolName: String, rawArgs: String): String {
         val argsObject =
-            runCatching { replayJson.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
+            runCatching { agentJson.parseToJsonElement(rawArgs).jsonObject }.getOrNull()
         if (argsObject == null) return AgentMessageText.abbreviate(rawArgs, 140)
 
         val preferredKeys = when {
@@ -1064,9 +1058,9 @@ internal class AgentSessionTimelineController(
                     return@runInEdt
                 }
 
-                val (seededConversation, seedRef) = payload
+                val seededConversation = payload.conversation
                 invalidateTimelineCache()
-                applySeededSessionState(seededConversation, seedRef)
+                applySeededSessionState(seededConversation, payload.messageHistory)
                 onCompleted(true)
             }
         }
@@ -1074,7 +1068,7 @@ internal class AgentSessionTimelineController(
 
     private suspend fun buildSessionStateFromTimelinePoint(
         point: RunTimelinePoint
-    ): Pair<Conversation, CheckpointRef>? {
+    ): SeededSessionState? {
         val checkpointRef = point.checkpointRef ?: return null
         val checkpoint = historyService.listCheckpoints(checkpointRef.agentId).firstOrNull()
             ?: historyService.loadCheckpoint(checkpointRef)

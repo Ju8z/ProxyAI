@@ -14,6 +14,9 @@ class SseMessageParser : MessageParser {
         const val HEADER_PARTS_LIMIT = 2
 
         val SEARCH_START_REGEX = Regex("""^\s*<{3,}(\s*SEARCH.*)?$""", RegexOption.IGNORE_CASE)
+        val INLINE_SEARCH_START_REGEX = Regex("""<{3,}\s*SEARCH\b.*""", RegexOption.IGNORE_CASE)
+        val INLINE_SEARCH_PREFIX_REGEX =
+            Regex("""^\s*<{3,}\s*SEARCH\s*""", RegexOption.IGNORE_CASE)
         val SEPARATOR_REGEX = Regex("""^\s*={3,}\s*$""")
         val REPLACE_END_REGEX = Regex("""^\s*>{3,}(\s*REPLACE.*)?$""", RegexOption.IGNORE_CASE)
     }
@@ -24,6 +27,18 @@ class SseMessageParser : MessageParser {
     fun clear() {
         parserState = ParserState.Outside
         buffer.clear()
+    }
+
+    fun startNewVisualSection() {
+        buffer.clear()
+        parserState = when (val state = parserState) {
+            is ParserState.Outside -> ParserState.Outside
+            is ParserState.CodeHeaderWaiting -> state.copy(content = "")
+            is ParserState.InCode -> state.copy(content = "")
+            is ParserState.InSearch -> state.copy(searchContent = "")
+            is ParserState.InReplace -> state.copy(searchContent = "", replaceContent = "")
+            is ParserState.InThinking -> ParserState.InThinking()
+        }
     }
 
     override fun parse(input: String): List<Segment> {
@@ -97,11 +112,18 @@ class SseMessageParser : MessageParser {
         consumeFromBuffer(nlIdx + 1)
 
         val updatedHeader = state.content + headerLine
-        val header = parseCodeHeader(updatedHeader)
+        val headerSplit = splitInlineSearchMarker(updatedHeader)
+        val header = parseCodeHeader(headerSplit.headerText)
 
         return if (header != null) {
             segments.add(header)
-            parserState = ParserState.InCode(header, indentation = state.indentation)
+            if (headerSplit.inlineSearchContent != null) {
+                val initialSearch = headerSplit.inlineSearchContent.trimStart()
+                segments.add(SearchWaiting(initialSearch, header.language, header.filePath))
+                parserState = ParserState.InSearch(header, initialSearch, state.indentation)
+            } else {
+                parserState = ParserState.InCode(header, indentation = state.indentation)
+            }
             true
         } else {
             segments.add(CodeHeaderWaiting(updatedHeader))
@@ -353,6 +375,21 @@ class SseMessageParser : MessageParser {
         } else null
     }
 
+    private fun splitInlineSearchMarker(headerText: String): HeaderSearchSplit {
+        val markerMatch = INLINE_SEARCH_START_REGEX.find(headerText)
+        if (markerMatch == null || markerMatch.range.first == 0) {
+            return HeaderSearchSplit(headerText, null)
+        }
+
+        val markerText = headerText.substring(markerMatch.range.first)
+        val inlineSearchContent = markerText
+            .replaceFirst(INLINE_SEARCH_PREFIX_REGEX, "")
+        return HeaderSearchSplit(
+            headerText = headerText.substring(0, markerMatch.range.first).trimEnd(),
+            inlineSearchContent = inlineSearchContent
+        )
+    }
+
     private fun isCodeFenceLine(line: String, indentation: String): Boolean {
         val trimmedEnd = line.trimEnd()
         if (!trimmedEnd.startsWith(indentation)) {
@@ -416,4 +453,9 @@ class SseMessageParser : MessageParser {
             val content: String = ""
         ) : ParserState()
     }
+
+    private data class HeaderSearchSplit(
+        val headerText: String,
+        val inlineSearchContent: String?
+    )
 }

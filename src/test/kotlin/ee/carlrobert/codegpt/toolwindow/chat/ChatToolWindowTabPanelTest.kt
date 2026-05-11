@@ -8,16 +8,21 @@ import ee.carlrobert.codegpt.completions.ConversationType
 import ee.carlrobert.codegpt.conversations.ConversationAttachedFile
 import ee.carlrobert.codegpt.conversations.ConversationService
 import ee.carlrobert.codegpt.conversations.message.Message
+import ee.carlrobert.codegpt.mcp.ConnectionStatus
 import ee.carlrobert.codegpt.settings.models.ModelSettings
 import ee.carlrobert.codegpt.settings.prompts.PromptsSettings
 import ee.carlrobert.codegpt.settings.service.FeatureType
 import ee.carlrobert.codegpt.settings.service.ServiceType
 import ee.carlrobert.codegpt.toolwindow.ToolWindowInitialState
+import ee.carlrobert.codegpt.ui.textarea.UserInputPanel
+import ee.carlrobert.codegpt.ui.textarea.header.tag.McpTagDetails
 import org.assertj.core.api.Assertions.assertThat
 import testsupport.IntegrationTest
 import testsupport.http.RequestEntity
 import testsupport.http.exchange.StreamHttpExchange
 import testsupport.json.JSONUtil.e
+import testsupport.json.JSONUtil.jsonArray
+import testsupport.json.JSONUtil.jsonMap
 import testsupport.json.JSONUtil.jsonMapResponse
 import java.io.File
 import java.util.*
@@ -130,16 +135,43 @@ class ChatToolWindowTabPanelTest : IntegrationTest() {
         }
     }
 
+    fun testChatInputExposesConversationIdForMcpAttachments() {
+        val conversation = ConversationService.getInstance().startConversation(project)
+        val panel = ChatToolWindowTabPanel(project, ToolWindowInitialState(conversation))
+
+        val userInputPanel = ChatToolWindowTabPanel::class.java
+            .getDeclaredField("userInputPanel")
+            .apply { isAccessible = true }
+            .get(panel) as UserInputPanel
+
+        assertThat(userInputPanel.getConversationId()).isEqualTo(conversation.id)
+    }
+
+    fun testLandingDraftStatePreservesPendingMcpTagBeforeConversationSend() {
+        val conversation = ConversationService.getInstance().startConversation(project)
+        val pendingTag = McpTagDetails(
+            serverId = "server-landing",
+            serverName = "Landing Server",
+            connectionStatus = ConnectionStatus.DISCONNECTED
+        )
+        val panel = ChatToolWindowTabPanel(
+            project,
+            ToolWindowInitialState(conversation, listOf(pendingTag))
+        )
+
+        panel.restoreDraftState(ToolWindowInitialState(conversation, listOf(pendingTag)))
+
+        assertThat(panel.selectedTags.filterIsInstance<McpTagDetails>())
+            .extracting<String> { it.serverId }
+            .contains("server-landing")
+    }
+
     private fun expectOpenAIStreamingHello(assertPrompt: (String) -> Unit) {
         expectOpenAI(StreamHttpExchange { request: RequestEntity ->
             assertThat(request.uri.path).isEqualTo("/v1/responses")
             assertThat(request.method).isEqualTo("POST")
             assertPrompt(extractPromptText(request))
-            listOf(
-                streamingChunk("Hel", 1),
-                streamingChunk("lo", 2),
-                streamingChunk("!", 3)
-            )
+            openAiResponsesChunks("Hello!")
         })
     }
 
@@ -151,6 +183,64 @@ class ChatToolWindowTabPanelTest : IntegrationTest() {
             e("content_index", 0),
             e("delta", content),
             e("sequence_number", sequenceNumber)
+        )
+    }
+
+    private fun openAiResponsesChunks(text: String): List<String> {
+        val chunks = text.chunked(3)
+        return chunks.mapIndexed { index, chunk ->
+            streamingChunk(chunk, index + 1)
+        } + jsonMapResponse(
+            e("type", "response.output_item.done"),
+            e("item", text),
+            e("output_index", 0),
+            e("sequence_number", chunks.size + 1)
+        ) + jsonMapResponse(
+            e("type", "response.completed"),
+            e(
+                "response",
+                jsonMap(
+                    e("id", "resp-test"),
+                    e("object", "response"),
+                    e("created_at", 1),
+                    e("model", "gpt-5-mini"),
+                    e(
+                        "output",
+                        jsonArray(
+                            jsonMap(
+                                e("type", "message"),
+                                e("id", "msg_1"),
+                                e("role", "assistant"),
+                                e("status", "completed"),
+                                e(
+                                    "content",
+                                    jsonArray(
+                                        jsonMap(
+                                            e("type", "output_text"),
+                                            e("text", text),
+                                            e("annotations", jsonArray())
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                    e("parallel_tool_calls", true),
+                    e("status", "completed"),
+                    e("text", jsonMap()),
+                    e(
+                        "usage",
+                        jsonMap(
+                            e("input_tokens", 1),
+                            e("input_tokens_details", jsonMap("cached_tokens", 0)),
+                            e("output_tokens", 1),
+                            e("output_tokens_details", jsonMap("reasoning_tokens", 0)),
+                            e("total_tokens", 2)
+                        )
+                    )
+                )
+            ),
+            e("sequence_number", chunks.size + 2)
         )
     }
 

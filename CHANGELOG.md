@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.1-261] - 2026-04-30
+
+### Changed
+
+- Upgraded Koog and the IntelliJ Platform baseline to 2026.1 / build 261
+
+### Fixed
+
+- Files and Folders `@` lookup now searches project files and folders together, prioritizes open and recent files, and keeps results stable while search results are still loading.
+- Agent continuation now skips unsafe checkpoints and removes dangling tool-call history before starting a new user turn.
+- Agent loading state is restored correctly after retries succeed.
+- Agent write and edit approval diffs now respect the configured tool approval mode.
+- Agent todo-list reminders are now shown only once per run.
+- TodoWrite progress updates in Agent run cards
+- External ACP agent switching no longer freezes the IDE when changing runtimes such as OpenCode and Codex [#1213](https://github.com/carlrobertoh/ProxyAI/issues/1213)
+- Bash tool execution now uses `sh` on BSD systems [#1208](https://github.com/carlrobertoh/ProxyAI/issues/1208)
+
 ## [3.8.0-241.1] - 2026-04-02
 
 ### Added
@@ -1314,7 +1331,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `OPENAI_API_KEY` persistence, key is saved in the OS password safe from now on
 
-[Unreleased]: https://github.com/carlrobertoh/ProxyAI/compare/v3.8.0-241.1...HEAD
+[Unreleased]: https://github.com/carlrobertoh/ProxyAI/compare/v3.8.1-261...HEAD
+[3.8.1-261]: https://github.com/carlrobertoh/ProxyAI/compare/v3.8.0-241.1...v3.8.1-261
 [3.8.0-241.1]: https://github.com/carlrobertoh/ProxyAI/compare/v3.7.5-241.1...v3.8.0-241.1
 [3.7.5-241.1]: https://github.com/carlrobertoh/ProxyAI/compare/v3.7.4-241.1...v3.7.5-241.1
 [3.7.4-241.1]: https://github.com/carlrobertoh/ProxyAI/compare/v3.7.3-241.1...v3.7.4-241.1

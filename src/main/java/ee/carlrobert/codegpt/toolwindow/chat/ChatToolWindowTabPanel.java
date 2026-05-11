@@ -33,12 +33,11 @@ import ee.carlrobert.codegpt.conversations.Conversation;
 import ee.carlrobert.codegpt.conversations.ConversationAttachedFile;
 import ee.carlrobert.codegpt.conversations.ConversationService;
 import ee.carlrobert.codegpt.conversations.message.Message;
-import ee.carlrobert.codegpt.mcp.ConnectionStatus;
-import ee.carlrobert.codegpt.mcp.McpSessionManager;
-import ee.carlrobert.codegpt.mcp.McpTool;
+import ee.carlrobert.codegpt.mcp.McpResolutionResult;
+import ee.carlrobert.codegpt.mcp.McpSelectionResolver;
+import ee.carlrobert.codegpt.mcp.McpTagStatusUpdater;
 import ee.carlrobert.codegpt.psistructure.PsiStructureProvider;
 import ee.carlrobert.codegpt.psistructure.models.ClassStructure;
-import ee.carlrobert.codegpt.settings.ProxyAISettingsService;
 import ee.carlrobert.codegpt.settings.service.FeatureType;
 import ee.carlrobert.codegpt.telemetry.TelemetryAction;
 import ee.carlrobert.codegpt.toolwindow.ToolWindowInitialState;
@@ -68,10 +67,8 @@ import java.awt.BorderLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -126,15 +123,8 @@ public class ChatToolWindowTabPanel implements Disposable {
         EditorUtil.getSelectedEditorSelectedText(project),
         this,
         psiStructureRepository);
-    userInputPanel = new UserInputPanel(
-        project,
-        totalTokensPanel,
-        this,
-        FeatureType.CHAT,
-        tagManager,
-        this::handleSubmit,
-        this::handleCancel,
-        true);
+    userInputPanel = createUserInputPanel();
+    registerMcpTagManager();
     initializeConversationAttachedFiles();
     userInputPanel.requestFocus();
 
@@ -178,6 +168,32 @@ public class ChatToolWindowTabPanel implements Disposable {
 
   public TotalTokensDetails getTokenDetails() {
     return totalTokensPanel.getTokenDetails();
+  }
+
+  private UserInputPanel createUserInputPanel() {
+    return new UserInputPanel(
+        project,
+        totalTokensPanel,
+        this,
+        FeatureType.CHAT,
+        tagManager,
+        this::handleSubmit,
+        this::handleCancel,
+        true,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        conversation::getId);
+  }
+
+  private void registerMcpTagManager() {
+    ApplicationManager.getApplication()
+        .getService(McpTagStatusUpdater.class)
+        .registerTagManager(conversation.getId(), tagManager);
   }
 
   public void requestFocusForTextArea() {
@@ -261,14 +277,13 @@ public class ChatToolWindowTabPanel implements Disposable {
         .filter(TagDetails::getSelected)
         .collect(Collectors.toList());
 
-    var builder = ChatCompletionParameters.builder(conversation, message)
+    var builder = ChatCompletionParameters.builder(project, conversation, message)
         .sessionId(chatSession.getId())
         .conversationType(conversationType)
         .imageDetailsFromPath(CodeGPTKeys.IMAGE_ATTACHMENT_FILE_PATH.get(project))
         .referencedFiles(ChatContextSupport.getReferencedFiles(project, selectedTags))
         .history(ChatContextSupport.getHistory(getSelectedTags()))
         .psiStructure(psiStructure)
-        .project(project)
         .chatMode(userInputPanel.getChatMode());
 
     findTagOfType(selectedTags, PersonaTagDetails.class)
@@ -277,17 +292,11 @@ public class ChatToolWindowTabPanel implements Disposable {
     findTagOfType(selectedTags, GitCommitTagDetails.class)
         .ifPresent(tag -> builder.gitDiff(tag.getFullMessage()));
 
-    var mcpTools = new ArrayList<McpTool>();
-    var mcpServerIds = new ArrayList<String>();
-
-    ApplicationManager.getApplication().getService(McpSessionManager.class)
-        .getSessionAttachments(conversation.getId())
-        .stream()
-        .filter(attachment -> attachment.getConnectionStatus() == ConnectionStatus.CONNECTED)
-        .forEach(attachment -> {
-          mcpTools.addAll(attachment.getAvailableTools());
-          mcpServerIds.add(attachment.getServerId());
-        });
+    McpResolutionResult mcpResolution = ApplicationManager.getApplication()
+        .getService(McpSelectionResolver.class)
+        .ensureConnected(conversation.getId(), selectedTags);
+    var mcpTools = new ArrayList<>(mcpResolution.getTools());
+    var mcpServerIds = new ArrayList<>(mcpResolution.getConnectedServerIds());
 
     if (!mcpTools.isEmpty()) {
       builder.mcpTools(mcpTools)
@@ -309,30 +318,6 @@ public class ChatToolWindowTabPanel implements Disposable {
 
   private ToolApprovalMode getToolApprovalMode() {
     return ToolApprovalMode.REQUIRE_APPROVAL;
-  }
-
-  private List<VirtualFile> collectVisibleFiles(
-      List<VirtualFile> inputFiles,
-      ProxyAISettingsService settingsService) {
-    var visibleFiles = new LinkedHashSet<VirtualFile>();
-    inputFiles.forEach(file -> appendVisibleFiles(file, settingsService, visibleFiles));
-    return visibleFiles.stream().toList();
-  }
-
-  private void appendVisibleFiles(
-      VirtualFile file,
-      ProxyAISettingsService settingsService,
-      LinkedHashSet<VirtualFile> output) {
-    if (!file.isValid() || !settingsService.isVirtualFileVisible(file)) {
-      return;
-    }
-    if (!file.isDirectory()) {
-      output.add(file);
-      return;
-    }
-
-    Arrays.stream(file.getChildren())
-        .forEach(child -> appendVisibleFiles(child, settingsService, output));
   }
 
   private void initializeConversationAttachedFiles() {
@@ -459,8 +444,7 @@ public class ChatToolWindowTabPanel implements Disposable {
   }
 
   public void includeFiles(List<VirtualFile> referencedFiles) {
-    var settingsService = project.getService(ProxyAISettingsService.class);
-    var visibleReferencedFiles = collectVisibleFiles(referencedFiles, settingsService);
+    var visibleReferencedFiles = ChatContextSupport.collectVisibleFiles(project, referencedFiles);
 
     userInputPanel.includeFiles(new ArrayList<>(visibleReferencedFiles));
     ReadAction.nonBlocking(() -> {
@@ -753,9 +737,8 @@ public class ChatToolWindowTabPanel implements Disposable {
     var userMessagePanel = new UserMessagePanel(project, message, this);
     userMessagePanel.addCopyAction(() -> CopyAction.copyToClipboard(message.getPrompt()));
     userMessagePanel.addReloadAction(() -> reloadMessage(
-        ChatCompletionParameters.builder(conversation, message)
+        ChatCompletionParameters.builder(project, conversation, message)
             .conversationType(ConversationType.DEFAULT)
-            .project(project)
             .chatMode(userInputPanel.getChatMode())
             .build(),
         userMessagePanel));

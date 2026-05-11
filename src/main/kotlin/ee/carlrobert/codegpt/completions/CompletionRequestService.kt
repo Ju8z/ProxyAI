@@ -5,6 +5,7 @@ import ai.koog.prompt.dsl.Prompt
 import ai.koog.prompt.dsl.prompt
 import ai.koog.prompt.llm.LLMCapability
 import ai.koog.prompt.llm.LLModel
+import com.intellij.openapi.project.Project
 import ee.carlrobert.codegpt.agent.AgentFactory
 import ee.carlrobert.codegpt.agent.clients.CustomOpenAILLMClient
 import ee.carlrobert.codegpt.agent.clients.HttpClientProvider
@@ -64,6 +65,7 @@ object CompletionRequestService {
 
     @JvmStatic
     fun getChatCompletionAsync(
+        project: Project,
         serviceType: ServiceType,
         prompt: Prompt,
         modelSelection: ModelSelection,
@@ -72,6 +74,7 @@ object CompletionRequestService {
         onToolCallUIUpdate: ((JPanel) -> Unit)? = null
     ): CancellableRequest {
         val request = CompletionRunnerRequest.Chat(
+            project = project,
             serviceType = serviceType,
             executor = AgentFactory.createExecutor(serviceType, featureType = FeatureType.CHAT),
             model = modelSelection.llmModel,
@@ -91,9 +94,10 @@ object CompletionRequestService {
     ): CancellableRequest {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val model = LLModel(
-            id = modelId?.takeIf { it.isNotBlank() } ?: "gpt-4.1-mini",
+            id = modelId.orEmpty(),
             provider = CustomOpenAILLMClient.CustomOpenAI,
             capabilities = listOf(
+                LLMCapability.Completion,
                 if (ResponsesApiUtil.isResponsesApiUrl(settings.url)) {
                     LLMCapability.OpenAIEndpoint.Responses
                 } else {

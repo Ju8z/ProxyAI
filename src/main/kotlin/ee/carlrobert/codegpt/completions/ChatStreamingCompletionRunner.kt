@@ -1,16 +1,9 @@
 package ee.carlrobert.codegpt.completions
 
-import ai.koog.prompt.streaming.StreamFrame
 import ee.carlrobert.codegpt.util.ReasoningFrameTextAdapter
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 
 internal object ChatStreamingCompletionRunner : CompletionRunner {
 
@@ -21,13 +14,8 @@ internal object ChatStreamingCompletionRunner : CompletionRunner {
     }
 
     private fun executeAsync(request: CompletionRunnerRequest.Chat): CancellableRequest {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val cancelled = AtomicBoolean(false)
-        val jobRef = AtomicReference<Job?>()
-        val cancellableRequest = CancellableRequest {
-            cancelled.set(true)
-            jobRef.get()?.cancel(CancellationException("Cancelled by user"))
-        }
+        val asyncRequest = AsyncRequestContext()
+        val scope = asyncRequest.scope
 
         request.eventListener.onOpen()
         val job = scope.launch {
@@ -35,7 +23,7 @@ internal object ChatStreamingCompletionRunner : CompletionRunner {
             try {
                 streamOrFallback(request, messageBuilder)
 
-                if (cancelled.get()) {
+                if (asyncRequest.isCancelled()) {
                     request.eventListener.onCancelled(StringBuilder(messageBuilder))
                     return@launch
                 }
@@ -52,9 +40,9 @@ internal object ChatStreamingCompletionRunner : CompletionRunner {
                 scope.cancel()
             }
         }
-        jobRef.set(job)
+        asyncRequest.attach(job)
 
-        return cancellableRequest
+        return asyncRequest.cancellableRequest
     }
 
     private suspend fun streamOrFallback(
@@ -67,19 +55,22 @@ internal object ChatStreamingCompletionRunner : CompletionRunner {
             request.executor.executeStreaming(request.prompt, request.model, emptyList())
                 .collect { frame ->
                     frameAdapter.consume(frame).forEach { chunk ->
-                        if (chunk.isNotEmpty()) {
-                            messageBuilder.append(chunk)
-                            request.eventListener.onMessage(chunk)
-                        }
+                        emit(chunk, request, messageBuilder)
                     }
                 }
         }.getOrElse {
             val responses = request.executor.execute(request.prompt, request.model, emptyList())
             val text = CompletionTextExtractor.extract(responses)
-            if (text.isNotBlank()) {
-                messageBuilder.append(text)
-                request.eventListener.onMessage(text)
-            }
+            emit(text, request, messageBuilder)
         }
+    }
+
+    private fun emit(
+        text: String,
+        request: CompletionRunnerRequest.Chat,
+        messageBuilder: StringBuilder
+    ) {
+        messageBuilder.append(text)
+        request.eventListener.onMessage(text)
     }
 }
